@@ -6,14 +6,13 @@
 // -> npm install (if lockfile changed) -> tsc build -> restart server -> health check.
 // Deploys the COMMITTED state; commit your changes first.
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const PHONE_HOME = "/data/data/com.termux/files/home";
 const APP_DIR = `${PHONE_HOME}/syncify-server`;
 const DATA_DIR = `${PHONE_HOME}/eari-sync-data`;
-const REMOTE_TGZ = "/sdcard/Download/syncify-server-deploy.tgz";
 
 function adbPath() {
   if (process.env.ADB) return process.env.ADB;
@@ -33,8 +32,14 @@ const sh = (cmd, opts = {}) => {
   }
   return (r.stdout || "").trim();
 };
-const phone = (script, timeout = 120000) =>
-  execFileSync(adb, ["shell", `run-as com.termux sh -c "${script}"`], { encoding: "utf8", timeout }).trim();
+const PHONE_ENV = "export PATH=/data/data/com.termux/files/usr/bin:/system/bin;";
+const phone = (script, timeout = 120000, input) =>
+  execFileSync(adb, ["shell", `run-as com.termux sh -c "${PHONE_ENV} ${script}"`], {
+    encoding: "utf8",
+    timeout,
+    input,
+    maxBuffer: 64 * 1024 * 1024,
+  }).trim();
 
 // 1. device check
 const devices = sh([adb, "devices"]);
@@ -46,7 +51,7 @@ console.log("adb device connected");
 
 // 2. local build (fail fast before touching the phone)
 console.log("building locally...");
-const build = spawnSync("npm", ["run", "build"], { encoding: "utf8", shell: true });
+const build = spawnSync("npm run build", { encoding: "utf8", shell: true });
 if (build.status !== 0) {
   throw new Error(`local build failed:\n${build.stderr || build.stdout || ""}`);
 }
@@ -58,16 +63,17 @@ const tgz = join(tmp, "deploy.tgz");
 sh(["git", "archive", "--format=tar.gz", "-o", tgz, "HEAD"]);
 console.log("archived HEAD ->", tgz);
 
-// 4. push + extract
-sh([adb, "push", tgz, REMOTE_TGZ]);
-phone(`mkdir -p ${APP_DIR}`);
-phone(`tar -xzf ${REMOTE_TGZ} -C ${APP_DIR}`);
+// 4. transfer via base64 over adb stdin (no /sdcard permission needed)
+const b64 = readFileSync(tgz).toString("base64");
+phone(`base64 -d > ${APP_DIR}/deploy.tgz`, 120000, b64);
+phone(`tar -xzf ${APP_DIR}/deploy.tgz -C ${APP_DIR}`);
+phone(`rm -f ${APP_DIR}/deploy.tgz`);
 console.log("extracted on phone");
 
 // 5. deps (skip when lockfile unchanged and node_modules present)
 phone(
   `cd ${APP_DIR} && { cmp -s package-lock.json .deploy-lock 2>/dev/null && [ -d node_modules ]; } || ` +
-    `{ npm install --omit=dev --no-audit --no-fund --loglevel=error && cp package-lock.json .deploy-lock; }`,
+    `{ npm install --no-audit --no-fund --loglevel=error && cp package-lock.json .deploy-lock; }`,
   600000,
 );
 console.log("deps ok");
@@ -79,19 +85,39 @@ phone(
 );
 console.log("built on phone");
 
-// 7. switchover (kills the old eari-sync server too - same cmdline pattern)
-const pids = phone(
-  `pkill -f "server/dist/main.js"; sleep 1; cd ${APP_DIR} && ` +
-    `EARI_SYNC_DATA_DIR=${DATA_DIR} nohup node server/dist/main.js >> ${PHONE_HOME}/syncify-server.log 2>&1 & sleep 2; ` +
-    `pgrep -f "server/dist/main.js"`,
-  60000,
+// 7. switchover: kill old, start new, verify via ps
+try {
+  phone(`pkill -f ^node.*server/dist/main; sleep 1; echo killed`, 60000);
+} catch {}
+// start: adb session won't close while the nohup'd server lives, so tolerate
+// the timeout and just require the "started" marker on stdout
+const start = spawnSync(
+  adb,
+  [
+    "shell",
+    `run-as com.termux sh -c "${PHONE_ENV} cd ${APP_DIR} && EARI_SYNC_DATA_DIR=${DATA_DIR} nohup node server/dist/main.js < /dev/null >> ${PHONE_HOME}/syncify-server.log 2>&1 & echo started"`,
+  ],
+  { encoding: "utf8", timeout: 20000, maxBuffer: 1024 * 1024 },
 );
-if (!pids) {
-  console.error("server did not start; log tail:");
-  console.log(phone(`tail -n 30 ${PHONE_HOME}/syncify-server.log 2>/dev/null || echo "(no log)"`));
+if (!/started/.test(start.stdout ?? "")) {
+  console.error("server start failed:", (start.stderr || start.stdout || "").trim());
   process.exit(1);
 }
-console.log("server running, pid:", pids.split(/\s+/).join(", "));
+console.log("start command issued");
+await new Promise((r) => setTimeout(r, 2500));
+const ps = phone(`ps -ef | grep dist/main.js | grep -v grep`, 60000);
+if (!ps.includes("node")) {
+  console.error("server not running; log tail:");
+  try {
+    console.log(phone(`tail -n 30 ${PHONE_HOME}/syncify-server.log 2>/dev/null`));
+  } catch {}
+  process.exit(1);
+}
+const pids = ps
+  .split("\n")
+  .map((l) => l.trim().split(/\s+/)[1])
+  .filter(Boolean);
+console.log("server running, pid:", pids.join(", "));
 
 // 8. health check from PC (end to end)
 await new Promise((r) => setTimeout(r, 3000));
