@@ -11,7 +11,8 @@
     "build": "npm run build -w shared && npm run build -w server",
     "test": "npm run test -w server",
     "start": "npm run start -w server",
-    "cli": "npm run cli -w server"
+    "cli": "npm run cli -w server",
+    "deploy:phone": "node scripts/phone-deploy.mjs"
   },
   "license": "MIT"
 }
