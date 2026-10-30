@@ -119,17 +119,23 @@ const pids = ps
   .filter(Boolean);
 console.log("server running, pid:", pids.join(", "));
 
-// 8. health check from PC (end to end)
-await new Promise((r) => setTimeout(r, 3000));
-try {
-  const res = await fetch("https://sync.earify.net:8443/health", { signal: AbortSignal.timeout(15000) });
-  const body = await res.text();
-  console.log("health:", res.status, body);
-  if (res.status !== 200) process.exit(1);
-} catch (e) {
-  console.error("health check failed:", e?.message ?? e);
-  console.log("log tail:", phone(`tail -n 30 ${PHONE_HOME}/syncify-server.log 2>/dev/null`));
-  process.exit(1);
+// 8. optional end-to-end health check from PC (set SYNCIFY_HEALTH_URL to enable;
+//    no server address is hardcoded in this public repo)
+const healthUrl = process.env.SYNCIFY_HEALTH_URL;
+if (healthUrl) {
+  await new Promise((r) => setTimeout(r, 3000));
+  try {
+    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(15000) });
+    const body = await res.text();
+    console.log("health:", res.status, body);
+    if (res.status !== 200) process.exit(1);
+  } catch (e) {
+    console.error("health check failed:", e?.message ?? e);
+    console.log("log tail:", phone(`tail -n 30 ${PHONE_HOME}/syncify-server.log 2>/dev/null`));
+    process.exit(1);
+  }
+} else {
+  console.log("health check skipped (set SYNCIFY_HEALTH_URL to enable)");
 }
 
 rmSync(tmp, { recursive: true, force: true });
